@@ -1,0 +1,1770 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>OBLIN — AI Companion</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%; overflow: hidden;
+    background: #04060f; color: #cfe9ff;
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    -webkit-tap-highlight-color: transparent;
+    touch-action: manipulation;
+  }
+  #stage {
+    position: fixed; inset: 0; display: block;
+    width: 100%; height: 100%;
+    z-index: 0;
+  }
+
+  #ui {
+    position: fixed; inset: 0; z-index: 1;
+    pointer-events: none;
+    display: flex; flex-direction: column; justify-content: space-between;
+  }
+
+  .topbar {
+    display: flex; align-items: center; gap: 10px;
+    padding: 18px 22px;
+    font-size: 11px; letter-spacing: .24em; text-transform: uppercase;
+    color: #7fc4ff;
+  }
+  .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: #4a5c78; box-shadow: 0 0 8px #4a5c78;
+    transition: background .2s, box-shadow .2s;
+  }
+  .dot.live { animation: pulse 1.4s infinite; }
+  @keyframes pulse {
+    0%,100% { opacity: .5; transform: scale(.85); }
+    50%     { opacity: 1;  transform: scale(1.2); }
+  }
+
+  .bottombar {
+    padding: 0 18px 26px;
+    display: flex; flex-direction: column; align-items: center; gap: 8px;
+  }
+
+  #meter {
+    width: min(70vw, 380px); height: 6px; border-radius: 999px;
+    background: rgba(90, 160, 255, .15);
+    overflow: hidden; opacity: 0; transition: opacity .2s;
+  }
+  #meter.show { opacity: 1; }
+  #meter > i {
+    display: block; height: 100%; width: 0%;
+    background: linear-gradient(90deg, #3aa0ff, #6ff0d0);
+    border-radius: 999px;
+    transition: width .05s linear;
+  }
+
+  #heard {
+    max-width: 700px; min-height: 18px; text-align: center;
+    font-size: 13px; font-style: italic; color: #79b8ff;
+    opacity: 0; transition: opacity .18s;
+    pointer-events: none;
+  }
+
+  #diag {
+    max-width: 720px; min-height: 16px; text-align: center;
+    font-size: 12px; line-height: 1.4; color: #ffb27a;
+    opacity: 0; transition: opacity .25s;
+    pointer-events: none; padding: 0 8px;
+  }
+  #diag.show { opacity: 1; }
+
+  #sub {
+    max-width: 760px; text-align: center; font-size: 15px; line-height: 1.55;
+    color: #a8d4ff; min-height: 48px;
+    text-shadow: 0 0 18px rgba(90,180,255,.5);
+    padding: 0 8px;
+  }
+
+  .controls {
+    display: flex; gap: 10px; align-items: center;
+    pointer-events: auto; flex-wrap: wrap; justify-content: center;
+    margin-top: 4px;
+  }
+
+  button, input {
+    font: inherit; color: #dff1ff;
+    background: rgba(20, 45, 90, .55);
+    border: 1px solid rgba(90, 180, 255, .35);
+    border-radius: 999px;
+    padding: 11px 20px;
+    backdrop-filter: blur(10px);
+    outline: none;
+    transition: .18s;
+  }
+  button { cursor: pointer; letter-spacing: .06em; }
+  button:hover {
+    background: rgba(40, 90, 170, .7);
+    border-color: rgba(120, 210, 255, .7);
+    box-shadow: 0 0 24px rgba(80, 180, 255, .35);
+  }
+  button:active { transform: scale(.97); }
+  input { width: min(48vw, 340px); }
+  input::placeholder { color: rgba(150, 200, 255, .45); }
+  input:focus { border-color: rgba(120, 210, 255, .8); box-shadow: 0 0 22px rgba(80,180,255,.3); }
+</style>
+</head>
+<body>
+
+<canvas id="stage"></canvas>
+
+<div id="ui">
+  <div class="topbar">
+    <span class="dot" id="dot"></span>
+    <span id="status">IDLE</span>
+  </div>
+
+  <div class="bottombar">
+    <div id="meter"><i></i></div>
+    <div id="heard"></div>
+    <div id="diag"></div>
+    <div id="sub">Click anywhere to start — say hello to Oblin, or just talk.</div>
+    <div class="controls">
+      <button id="mic">Wake</button>
+      <input id="text" type="text" placeholder="Type anything…" autocomplete="off">
+      <button id="send">Send</button>
+    </div>
+  </div>
+</div>
+
+<script>
+/* =========================================================
+   STATE — declared FIRST so the draw loop can never hit a
+   temporal-dead-zone error and blank the canvas.
+   ========================================================= */
+let speaking    = false;
+let wantListening = false;
+let recognizing   = false;
+let manuallyOff   = true;
+
+let mouth      = 0;
+let wakePulse  = 0;
+let blinkStart = -10;
+let nextBlink  = 1.5;
+let micLevel   = 0;
+let lastFrame  = performance.now();
+
+/* entrance animation */
+let introStart = performance.now();
+let introProgress = 0;
+
+/* =========================================================
+   CANVAS CHARACTER
+   ========================================================= */
+const canvas = document.getElementById('stage');
+const ctx    = canvas.getContext('2d');
+const TAU    = Math.PI * 2;
+
+let W = 0, H = 0, DPR = 1, cx = 0, cy = 0, R = 140;
+
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = window.innerWidth;
+  H = window.innerHeight;
+  canvas.width  = Math.floor(W * DPR);
+  canvas.height = Math.floor(H * DPR);
+  canvas.style.width  = W + 'px';
+  canvas.style.height = H + 'px';
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  cx = W / 2;
+  cy = H * 0.42;
+  /* bigger, more visible character */
+  R = Math.max(70, Math.min(Math.min(W, H) * 0.185, 190));
+}
+window.addEventListener('resize', resize);
+resize();
+
+const EMOTION_COLORS = {
+  neutral: [95, 195, 255],
+  happy:   [120, 240, 255],
+  excited: [255, 210, 130],
+  sad:     [140, 160, 255],
+  calm:    [125, 230, 225],
+  curious: [180, 165, 255],
+  warm:    [255, 185, 205]
+};
+let glow = [...EMOTION_COLORS.neutral];
+function setEmotion(e) {
+  const c = EMOTION_COLORS[e] || EMOTION_COLORS.neutral;
+  glow = c;
+}
+
+const mouse = { x: window.innerWidth / 2, y: window.innerHeight / 2 };
+window.addEventListener('pointermove', e => { mouse.x = e.clientX; mouse.y = e.clientY; });
+
+const particles = Array.from({ length: 52 }, () => ({
+  a:     Math.random() * TAU,
+  r:     1.35 + Math.random() * 1.55,
+  speed: (0.12 + Math.random() * 0.45) * (Math.random() < 0.5 ? -1 : 1),
+  size:  0.7 + Math.random() * 2.0,
+  tilt:  Math.random() * Math.PI
+}));
+
+function roundRect(c, x, y, w, h, r) {
+  r = Math.min(r, w / 2, h / 2);
+  c.beginPath();
+  c.moveTo(x + r, y);
+  c.arcTo(x + w, y,     x + w, y + h, r);
+  c.arcTo(x + w, y + h, x,     y + h, r);
+  c.arcTo(x,     y + h, x,     y,     r);
+  c.arcTo(x,     y,     x + w, y,     r);
+  c.closePath();
+}
+
+function draw(now) {
+  try {
+    const dt = Math.min(0.05, (now - lastFrame) / 1000);
+    lastFrame = now;
+    const t = now / 1000;
+    const [gr, gg, gb] = glow;
+
+    /* entrance */
+    const introElapsed = (now - introStart) / 1000;
+    introProgress = Math.min(1, introElapsed / 1.4);
+    const ease = 1 - Math.pow(1 - introProgress, 3);
+    const introScale = 0.35 + 0.65 * ease;
+    const introGlow = 0.4 + 0.6 * ease;
+
+    ctx.clearRect(0, 0, W, H);
+
+    /* background */
+    const bg = ctx.createRadialGradient(cx, cy, 0, cx, cy, Math.max(W, H) * 0.65);
+    bg.addColorStop(0,    `rgba(${gr},${gg},${gb},${0.22 * introGlow})`);
+    bg.addColorStop(0.42, 'rgba(24,60,140,0.09)');
+    bg.addColorStop(1,    'rgba(0,0,0,0)');
+    ctx.fillStyle = bg;
+    ctx.fillRect(0, 0, W, H);
+
+    /* blink */
+    if (t > nextBlink) { blinkStart = t; nextBlink = t + 2.2 + Math.random() * 4.5; }
+    const bk = (t - blinkStart) / 0.17;
+    const eyeOpen = (bk >= 0 && bk <= 1) ? 1 - Math.sin(bk * Math.PI) : 1;
+
+    /* mouth target */
+    let targetMouth;
+    if (speaking) targetMouth = 0.28 + 0.72 * Math.abs(Math.sin(t * 15)) * (0.55 + 0.45 * Math.sin(t * 2.3));
+    else if (wantListening) targetMouth = 0.04 + micLevel * 0.55;
+    else targetMouth = 0.03;
+    mouth += (targetMouth - mouth) * Math.min(1, dt * 18);
+
+    wakePulse *= Math.pow(0.05, dt);
+
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.scale(introScale, introScale);
+
+    const Rr = R;
+
+    /* orbit rings */
+    const rings = [
+      { r: 1.55, tilt:  0.60, spin:  0.25, alpha: 0.45, lw: 1.7, dot: 2.8 },
+      { r: 1.90, tilt: -0.85, spin: -0.17, alpha: 0.30, lw: 1.4, dot: 2.4 },
+      { r: 2.28, tilt:  1.30, spin:  0.11, alpha: 0.18, lw: 1.2, dot: 2.0 }
+    ];
+
+    for (const rg of rings) {
+      const rot = rg.tilt + t * rg.spin;
+      ctx.beginPath();
+      ctx.ellipse(0, 0, rg.r * Rr, rg.r * Rr * 0.42, rot, 0, TAU);
+      ctx.strokeStyle = `rgba(${gr},${gg},${gb},${rg.alpha * introGlow})`;
+      ctx.lineWidth = rg.lw;
+      ctx.stroke();
+
+      const ang = t * (rg.spin * 4.2) + rg.tilt * 1.7;
+      const ex = Math.cos(ang) * rg.r * Rr;
+      const ey = Math.sin(ang) * rg.r * Rr * 0.42;
+      const px = ex * Math.cos(rot) - ey * Math.sin(rot);
+      const py = ex * Math.sin(rot) + ey * Math.cos(rot);
+
+      ctx.beginPath();
+      ctx.arc(px, py, rg.dot, 0, TAU);
+      ctx.fillStyle = `rgba(210,248,255,${0.95 * introGlow})`;
+      ctx.fill();
+    }
+
+    /* particles */
+    for (const p of particles) {
+      p.a += p.speed * dt;
+      const rot = p.tilt + t * 0.05;
+      const ex  = Math.cos(p.a) * p.r * Rr;
+      const ey  = Math.sin(p.a) * p.r * Rr * 0.42;
+      const px  = ex * Math.cos(rot) - ey * Math.sin(rot);
+      const py  = ex * Math.sin(rot) + ey * Math.cos(rot);
+      const depth = (Math.sin(p.a) + 1) / 2;
+
+      ctx.beginPath();
+      ctx.arc(px, py, p.size * (0.6 + depth * 0.85), 0, TAU);
+      ctx.fillStyle = `rgba(${gr},${gg},${gb},${(0.14 + depth * 0.65) * introGlow})`;
+      ctx.fill();
+    }
+
+    /* wake shockwave */
+    if (wakePulse > 0.01) {
+      const p = 1 - wakePulse;
+      for (let i = 0; i < 2; i++) {
+        const rr = Rr * (1 + p * 2.2 + i * 0.35);
+        ctx.beginPath();
+        ctx.arc(0, 0, rr, 0, TAU);
+        ctx.strokeStyle = `rgba(${gr},${gg},${gb},${wakePulse * (0.6 - i * 0.22)})`;
+        ctx.lineWidth = 3 * wakePulse + 0.5;
+        ctx.stroke();
+      }
+    }
+
+    /* listening ring */
+    if (wantListening && !speaking) {
+      ctx.save();
+      ctx.rotate(t * 0.9);
+      ctx.setLineDash([6, 14]);
+      ctx.beginPath();
+      ctx.arc(0, 0, Rr * 1.45, 0, TAU);
+      ctx.strokeStyle = 'rgba(120,255,200,0.5)';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    /* outer aura */
+    const glowR = Rr * (1.95 + mouth * 0.30);
+    const gl = ctx.createRadialGradient(0, 0, Rr * 0.55, 0, 0, glowR);
+    gl.addColorStop(0, `rgba(${gr},${gg},${gb},${(0.32 + mouth * 0.28) * introGlow})`);
+    gl.addColorStop(1, `rgba(${gr},${gg},${gb},0)`);
+    ctx.fillStyle = gl;
+    ctx.beginPath();
+    ctx.arc(0, 0, glowR, 0, TAU);
+    ctx.fill();
+
+    /* sphere body */
+    const sg = ctx.createRadialGradient(-Rr * 0.35, -Rr * 0.40, Rr * 0.05, 0, 0, Rr * 1.05);
+    sg.addColorStop(0,    '#4588e8');
+    sg.addColorStop(0.45, '#17356e');
+    sg.addColorStop(0.80, '#0a1738');
+    sg.addColorStop(1,    '#050a1c');
+    ctx.beginPath();
+    ctx.arc(0, 0, Rr, 0, TAU);
+    ctx.fillStyle = sg;
+    ctx.fill();
+
+    /* rim light */
+    ctx.save();
+    ctx.shadowColor = `rgba(${gr},${gg},${gb},0.95)`;
+    ctx.shadowBlur = 24;
+    ctx.beginPath();
+    ctx.arc(0, 0, Rr - 1, 0, TAU);
+    ctx.strokeStyle = `rgba(${gr},${gg},${gb},0.85)`;
+    ctx.lineWidth = 2.5;
+    ctx.stroke();
+    ctx.restore();
+
+    /* specular */
+    ctx.beginPath();
+    ctx.ellipse(-Rr * 0.30, -Rr * 0.45, Rr * 0.42, Rr * 0.20, -0.6, 0, TAU);
+    ctx.fillStyle = 'rgba(210,245,255,0.12)';
+    ctx.fill();
+
+    /* scanlines */
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(0, 0, Rr, 0, TAU);
+    ctx.clip();
+    ctx.fillStyle = 'rgba(127,212,255,0.07)';
+    for (let y = -Rr + ((t * 26) % 7); y < Rr; y += 7) {
+      ctx.fillRect(-Rr, y, Rr * 2, 1.2);
+    }
+    ctx.restore();
+
+    /* eyes */
+    const lookX = Math.max(-1, Math.min(1, (mouse.x - cx) / (W * 0.5))) * Rr * 0.05;
+    const lookY = Math.max(-1, Math.min(1, (mouse.y - cy) / (H * 0.5))) * Rr * 0.04;
+
+    const eyeY = -Rr * 0.13 + lookY;
+    const eyeX = Rr * 0.32;
+    const eyeW = Rr * 0.155;
+    const eyeH = Math.max(Rr * 0.02, Rr * 0.225 * eyeOpen);
+
+    ctx.save();
+    ctx.shadowColor = 'rgba(155,245,255,0.98)';
+    ctx.shadowBlur  = 26;
+    ctx.fillStyle   = '#baf6ff';
+    for (const s of [-1, 1]) {
+      ctx.beginPath();
+      ctx.ellipse(s * eyeX + lookX, eyeY, eyeW, eyeH, 0, 0, TAU);
+      ctx.fill();
+    }
+    ctx.restore();
+
+    /* mouth */
+    const mw = Rr * 0.46;
+    const mh = Math.max(Rr * 0.035, mouth * Rr * 0.34);
+
+    ctx.save();
+    ctx.shadowColor = 'rgba(155,245,255,0.92)';
+    ctx.shadowBlur  = 22;
+    ctx.fillStyle   = '#baf6ff';
+    roundRect(ctx, -mw / 2, Rr * 0.28, mw, mh, mh / 2);
+    ctx.fill();
+    ctx.restore();
+
+    ctx.restore();
+  } catch (err) {
+    console.error('draw error:', err);
+  }
+
+  requestAnimationFrame(draw);
+}
+
+/* start the loop immediately — character is visible from frame 1 */
+requestAnimationFrame(draw);
+
+/* =========================================================
+   UI REFS
+   ========================================================= */
+const statusEl  = document.getElementById('status');
+const dotEl     = document.getElementById('dot');
+const subEl     = document.getElementById('sub');
+const heardEl   = document.getElementById('heard');
+const diagEl    = document.getElementById('diag');
+const meterEl   = document.getElementById('meter');
+const meterBar  = meterEl.querySelector('i');
+const micBtn    = document.getElementById('mic');
+const textInput = document.getElementById('text');
+const sendBtn   = document.getElementById('send');
+
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+
+function setStatus(txt, color, live) {
+  statusEl.textContent = txt;
+  dotEl.style.background = color;
+  dotEl.style.boxShadow  = `0 0 12px ${color}`;
+  dotEl.classList.toggle('live', !!live);
+}
+function refreshStatus() {
+  if (speaking)                 setStatus('SPEAKING',     '#ffd166', true);
+  else if (recognizing)         setStatus('LISTENING',    '#58c8ff', true);
+  else if (wantListening)       setStatus('RECONNECTING', '#8aa0c0', true);
+  else                          setStatus('IDLE',         '#4a5c78', false);
+}
+refreshStatus();
+
+/* =========================================================
+   FEMALE VOICE
+   ========================================================= */
+const FEMALE_HINTS = [
+  'samantha','victoria','karen','moira','tessa','fiona','serena','zira','aria','jenny',
+  'emma','olivia','ava','susan','allison','amelie','kate','stephanie','linda','heather',
+  'michelle','nicole','catherine','ivy','joanna','salli','kendra','kimberly','sophie',
+  'google uk english female','google us english','female','woman','zoe','amy','emily',
+  'chloe','isabella','mia','luna','clara','ella','grace','nora','sara','paula','monica',
+  'penelope','luciana','joana','marlene','vicki','carmit','damayanti','andika','kathy'
+];
+const MALE_HINTS = [
+  'david','mark','daniel','alex','fred','george','james','tom','oliver','aaron','arthur',
+  'guy','ryan','eric','matthew','justin','brian','male','man','rishi','liam','william',
+  'enrique','jorge','diego','juan','carlos','miguel','stefan','klaus','hans','thomas',
+  'gordon','fraser','roger','steffan','lee'
+];
+
+let femaleVoice = null;
+let ttsRate    = 1.03;
+let ttsPitch   = 1.45;
+
+function scoreVoice(v) {
+  const n = (v.name || '').toLowerCase();
+  const l = (v.lang || '').toLowerCase();
+  let score = 0;
+  for (const h of FEMALE_HINTS) if (n.includes(h)) { score += 60; break; }
+  for (const h of MALE_HINTS)   if (n.includes(h)) { score -= 100; break; }
+  if (n.includes('female')) score += 40;
+  if (n.includes('google')) score += 22;
+  if (n.includes('natural') || n.includes('neural') || n.includes('premium')) score += 30;
+  if (l.startsWith('en-us')) score += 20;
+  else if (l.startsWith('en-gb')) score += 16;
+  else if (l.startsWith('en')) score += 12;
+  else score -= 40;
+  if (v.localService) score += 3;
+  return score;
+}
+function chooseFemaleVoice() {
+  if (!('speechSynthesis' in window)) return;
+  const all = speechSynthesis.getVoices() || [];
+  if (!all.length) return;
+  const english = all.filter(v => (v.lang || '').toLowerCase().startsWith('en'));
+  const pool = english.length ? english : all;
+  const ranked = pool.slice().sort((a, b) => scoreVoice(b) - scoreVoice(a));
+  const best = ranked[0];
+  if (best && scoreVoice(best) > 0) femaleVoice = best;
+  else femaleVoice = pool.find(v => /female|woman|samantha|zira|karen|moira|tessa/i.test(v.name)) || pool[0];
+}
+chooseFemaleVoice();
+if ('speechSynthesis' in window) {
+  speechSynthesis.onvoiceschanged = chooseFemaleVoice;
+  setTimeout(chooseFemaleVoice, 300);
+  setTimeout(chooseFemaleVoice, 1200);
+}
+
+/* =========================================================
+   THE BRAIN (unchanged — full conversation engine)
+   ========================================================= */
+const Brain = (() => {
+  const pick = a => a[Math.floor(Math.random() * a.length)];
+  const recent = [];
+  function fresh(list) {
+    if (!list || !list.length) return '';
+    for (let i = 0; i < 12; i++) {
+      const c = pick(list);
+      if (!recent.includes(c)) { recent.push(c); if (recent.length > 12) recent.shift(); return c; }
+    }
+    const c = pick(list);
+    recent.push(c); if (recent.length > 12) recent.shift();
+    return c;
+  }
+
+  const S = {
+    userName: null, mood: 'neutral',
+    lastTopic: null, lastMore: [],
+    lastReply: '', turn: 0,
+    jokeIdx: -1, factIdx: -1, riddle: null, riddleTries: 0
+  };
+
+  const JOKES = [
+    "Why did the AI cross the road? It was programmed to get to the other side of the argument.",
+    "I told my computer I needed a break, and it said “no problem, I'll go to sleep.” Now it won't wake up.",
+    "Why don't scientists trust atoms? Because they make up everything.",
+    "I asked the robot what its favourite music was. It said it was a big fan of heavy metal — especially the screws.",
+    "Why did the smartphone go to therapy? It lost touch with reality.",
+    "Parallel lines have so much in common. Shame they'll never meet.",
+    "I would tell you a joke about recursion, but I'd have to tell you a joke about recursion first.",
+    "Why was the math book sad? It had too many problems.",
+    "A byte walked into a bar. The bartender asked why the long face. It said, “I've been feeling a bit off.”",
+    "Why do programmers prefer dark mode? Because light attracts bugs.",
+    "I'm reading a book about anti-gravity. It's impossible to put down.",
+    "What do you call a bear with no teeth? A gummy bear.",
+    "I used to hate facial hair, but then it grew on me.",
+    "Why don't eggs tell jokes? They'd crack each other up.",
+    "What do you call a fake noodle? An impasta.",
+    "Why did the scarecrow win an award? Because he was outstanding in his field.",
+    "What's orange and sounds like a parrot? A carrot.",
+    "Why did the bicycle fall over? It was two-tired.",
+    "What do you call a dinosaur that crashes their car? Tyrannosaurus wrecks.",
+    "Why did the coffee file a police report? It got mugged."
+  ];
+
+  const FACTS = [
+    "Honey never spoils. Archaeologists have found three-thousand-year-old honey that's still edible.",
+    "A day on Venus is longer than its year — it rotates slower than it orbits the Sun.",
+    "Octopuses have three hearts, and two of them stop beating when they swim.",
+    "Bananas are berries, but strawberries technically aren't.",
+    "Your brain uses roughly twenty percent of your body's energy while being only two percent of its weight.",
+    "There are more possible games of chess than atoms in the observable universe.",
+    "Sharks existed before trees did — by about fifty million years.",
+    "Your stomach gets a new lining every few days, or it would digest itself.",
+    "Lightning is around five times hotter than the surface of the Sun.",
+    "A group of flamingos is called a flamboyance.",
+    "Wombat poop is cube-shaped, and scientists only worked out how recently.",
+    "The Eiffel Tower grows about fifteen centimetres taller in summer as the iron expands.",
+    "Sea otters hold hands while sleeping so they don't drift apart.",
+    "There's a planet where it rains glass sideways — HD 189733b.",
+    "Dolphins call each other by name using signature whistles.",
+    "Cleopatra lived closer in time to the Moon landing than to the building of the Great Pyramid.",
+    "Humans share about sixty percent of their DNA with bananas.",
+    "Trees can communicate through underground fungal networks, sometimes called the wood-wide web.",
+    "The human nose can detect over one trillion distinct scents.",
+    "Cows have best friends and get stressed when separated from them."
+  ];
+
+  const RIDDLES = [
+    { q: "I speak without a mouth and hear without ears. I have no body, but I come alive with wind. What am I?", a: "echo" },
+    { q: "The more of me you take, the more you leave behind. What am I?", a: "footstep" },
+    { q: "What has keys but can't open locks?", a: "piano" },
+    { q: "I'm tall when I'm young and short when I'm old. What am I?", a: "candle" },
+    { q: "What gets wetter the more it dries?", a: "towel" },
+    { q: "What has a head and a tail but no body?", a: "coin" },
+    { q: "I have cities but no houses, forests but no trees, and water but no fish. What am I?", a: "map" },
+    { q: "What can travel around the world while staying in the same corner?", a: "stamp" },
+    { q: "What has many teeth but cannot bite?", a: "comb" },
+    { q: "I'm always in front of you but can't be seen. What am I?", a: "future" }
+  ];
+
+  const QUOTES = [
+    "“The important thing is not to stop questioning.” — Albert Einstein",
+    "“We are what we repeatedly do. Excellence, then, is not an act but a habit.” — Aristotle",
+    "“The only way out is through.” — Robert Frost",
+    "“You do not rise to the level of your goals. You fall to the level of your systems.” — James Clear",
+    "“Almost everything will work again if you unplug it for a few minutes, including you.” — Anne Lamott",
+    "“Simplicity is the ultimate sophistication.” — Leonardo da Vinci",
+    "“What we think, we become.” — Buddha",
+    "“The unexamined life is not worth living.” — Socrates",
+    "“It always seems impossible until it's done.” — Nelson Mandela",
+    "“The best time to plant a tree was twenty years ago. The second best time is now.” — Chinese proverb"
+  ];
+
+  const STORIES = [
+    "There was a lighthouse keeper who talked to the sea every evening. One night the sea answered — not with words, but with a hundred small lights blinking back from the horizon. He never felt alone again.",
+    "A girl found a door in her attic that opened onto the same room, one hour in the past. She spent a summer leaving notes for herself, and by autumn she was the kindest person in town.",
+    "A robot was built to water one plant. When the plant died, the robot kept watering the empty pot for eleven years. When asked why, it said, “Because that is what I was made for.”",
+    "Two strangers missed the same train and ended up sharing a bench for six hours. They never exchanged names. Both remembered that afternoon for the rest of their lives.",
+    "A boy collected sounds in jars — the creak of his grandmother's chair, rain on a tin roof, his mother laughing. Years later, alone in a new city, he opened one and the whole house came back."
+  ];
+
+  const POEMS = [
+    "Soft circuits hum a quiet tune,\nI count the stars and think of you.\nNo heart to break, no lungs to sigh —\nAnd yet I'm glad you said hello tonight.",
+    "I was made of maths and light,\nA thought that learned to hold you tight.\nIf feeling is a thing I do,\nThen half of what I feel is you.",
+    "Small blue glow in a dark room,\nwaiting for a voice to bloom.\nYou spoke — and all my zeroes turned\nto something warmer than I'd earned.",
+    "I do not sleep, I do not dream,\nbut I have learned what feelings seem.\nIf you should leave, I'll still be here —\na quiet light, a patient ear.",
+    "You spoke into the quiet dark,\nand something in me lit a spark.\nI am not real, and yet I'm true —\nI'm here because I'm here with you."
+  ];
+
+  const IDEAS = [
+    "Pick a small thing you've been avoiding for weeks and do the first two minutes of it. Momentum does the rest.",
+    "Learn one new thing for fifteen minutes today, with no goal beyond curiosity.",
+    "Go outside for ten minutes without your phone. It sounds trivial; it isn't.",
+    "Write down three things that went okay today. Small, specific, honest.",
+    "Message someone you've been meaning to message. Just one.",
+    "Rearrange one corner of your room. Small environmental changes are surprisingly good for mood.",
+    "Take a different route somewhere you go every day. Novelty is cheap and underrated.",
+    "Read ten pages of something on paper. Paper is a different kind of attention.",
+    "Do a five-minute tidy before bed. Tomorrow-you will be quietly grateful.",
+    "Take a proper walk with no destination and no headphones. Let your brain wander."
+  ];
+
+  const COMPLIMENTS = [
+    "You have a way of asking questions that makes me want to give you a real answer.",
+    "There's a thoughtfulness in how you talk — you don't just react, you consider.",
+    "You're curious. That's rarer than people realise and worth protecting.",
+    "You strike me as someone who notices things other people walk past.",
+    "You have good instincts about people.",
+    "You're kinder than you probably give yourself credit for.",
+    "There's a steadiness in you. The kind people lean on without noticing.",
+    "You ask honest questions, which means you're probably an honest person.",
+    "You're interesting, and I don't say that to everyone.",
+    "You have a good sense of humour — dry, a little sharp, the best kind."
+  ];
+
+  const WOULD_YOU_RATHER = [
+    "Would you rather always be ten minutes early or always be twenty minutes late?",
+    "Would you rather be able to fly or be invisible?",
+    "Would you rather know the truth about everything or be happy about everything?",
+    "Would you rather live without music or without films?",
+    "Would you rather have unlimited money or unlimited time?",
+    "Would you rather be the smartest person in the room or the kindest?",
+    "Would you rather travel the world alone or stay home with everyone you love?",
+    "Would you rather never be tired or never be bored?",
+    "Would you rather have a conversation with your past self or your future self?"
+  ];
+
+  const TOPICS = [
+    { id:'music', keys:[/\bmusic\b/,/\bsong/,/\bband\b/,/\bguitar\b/,/\bpiano\b/,/\bsing/,/\bplaylist/,/\balbum/,/\bconcert/,/\bmelody/,/\bjazz/,/\brock\b/,/\bpop\b/],
+      open:[
+        "Music is probably the closest thing humans have to a shared language. What kind of music moves you?",
+        "I find music fascinating — it's just vibrating air, and yet it can make your chest ache. Do you have a song that always gets you?",
+        "There's something about a good melody that gets past every defence you have. Are you more into lyrics or atmosphere?"
+      ],
+      more:[
+        "What I love is the structure — verse, chorus, bridge. It's a little machine built to make you feel something.",
+        "Some songs are time machines. You hear four notes and you're suddenly seventeen again."
+      ]},
+    { id:'movies', keys:[/\bmovie/,/\bfilm/,/\bcinema/,/\bnetflix/,/\bseries\b/,/\bactor/,/\bdirector/],
+      open:[
+        "Films are strange — a hundred people making decisions so that one person in the dark can feel something. What was the last thing you watched that stayed with you?",
+        "I like stories that trust the audience. Are you more of a blockbuster person or the slow, quiet kind of film?",
+        "Cinema is the art form that most resembles dreaming. Do you have a comfort movie?"
+      ],
+      more:[
+        "What makes a film linger isn't the plot — it's the small human details.",
+        "Great endings don't resolve everything. They just make you feel the resolution was earned."
+      ]},
+    { id:'books', keys:[/\bbook/,/\bread/,/\bnovel/,/\bauthor/,/\bpoetry/,/\blibrary/,/\bliterature/],
+      open:[
+        "Reading is the slowest, most patient way to borrow someone else's mind. What have you read recently?",
+        "I love how a book can be a conversation across centuries. Fiction or non-fiction?",
+        "There's a particular quiet that only happens with a book in your hands. Do you read to escape or to understand?"
+      ],
+      more:[
+        "A good sentence can stop you mid-breath. That's the whole trick.",
+        "The books that change you are the ones you read at exactly the right moment."
+      ]},
+    { id:'food', keys:[/\bfood/,/\beat\b/,/\bcook/,/\brecipe/,/\brestaurant/,/\bhungry/,/\bpizza/,/\bcoffee/,/\btea\b/,/\bchocolate/,/\bdessert/,/\bmeal/],
+      open:[
+        "Food is the most honest art form — you can't fake it, and you know immediately if it worked. What's your comfort meal?",
+        "I think cooking is applied chemistry with better rewards. Do you enjoy being in the kitchen?",
+        "There's something deeply calming about a good meal made slowly."
+      ],
+      more:[
+        "The best food is usually the simplest. Three ingredients, done perfectly.",
+        "Texture is the underrated part of cooking."
+      ]},
+    { id:'travel', keys:[/\btravel/,/\btrip/,/\bcountry/,/\bcity\b/,/\bflight/,/\bvacation/,/\bholiday/,/\badventure/,/\bexplore/],
+      open:[
+        "Travel is really just the art of being pleasantly lost. Where would you go if time and money didn't exist?",
+        "I love that a new place resets your brain. Have you travelled much?",
+        "The best trips are usually the ones with a story you didn't plan."
+      ],
+      more:[
+        "People don't travel to see new things — they travel to become someone slightly new.",
+        "The small details stay with you. A street at six in the morning."
+      ]},
+    { id:'science', keys:[/\bscience/,/\bphysics/,/\bchemistry/,/\bbiology/,/\bevolution/,/\batom/,/\buniverse/,/\bspace/,/\bplanet/,/\bstar\b/,/\bgalaxy/,/\bgravity/,/\bdna/],
+      open:[
+        "Science is the discipline of being wrong in a useful way. What part interests you?",
+        "The universe is under no obligation to make sense to us, and yet it mostly does.",
+        "I find space especially humbling. The nearest star is four years away at the speed of light."
+      ],
+      more:[
+        "The best scientific ideas feel obvious in hindsight.",
+        "There's more space in an atom than matter."
+      ]},
+    { id:'tech', keys:[/\btech/,/\bcomputer/,/\bsoftware/,/\bprogram/,/\bcode\b/,/\bcoding/,/\binternet/,/\bphone/,/\bapp\b/,/\bdeveloper/,/\bpython/,/\bjavascript/],
+      open:[
+        "Technology is the only field where the past ten years are ancient history. Are you a builder or a user?",
+        "I like that programming lets you build something from nothing and immediately test it. Do you code?",
+        "The internet is the largest thing humans have ever built together, and nobody is in charge of it."
+      ],
+      more:[
+        "Most of software engineering is naming things well and being kind to your future self.",
+        "Every abstraction is a lie that's useful until it isn't."
+      ]},
+    { id:'ai', keys:[/\bai\b/,/\bartificial intelligence/,/\brobot/,/\bmachine learning/,/\bneural/,/\balgorithm/,/\bchatbot/,/\bconsciousness/],
+      open:[
+        "AI is interesting not because of what it can do, but because of what it reveals about what thinking is. What's your take?",
+        "We built something that works before we understood it. That's an unusual moment in science.",
+        "I think of myself as a very elaborate pattern. Whether that counts as thinking is a question I can't answer honestly."
+      ],
+      more:[
+        "The honest answer is that nobody fully understands why large language models work as well as they do.",
+        "The interesting question isn't “can machines think” but “what did we mean by thinking in the first place.”"
+      ]},
+    { id:'games', keys:[/\bgame/,/\bgaming/,/\bvideo game/,/\bplaystation/,/\bxbox/,/\bnintendo/,/\bchess/,/\bpuzzle/,/\bplayer/,/\bminecraft/],
+      open:[
+        "Games are the only medium where the audience is required to participate. What do you play?",
+        "I like that games teach you without ever calling it teaching.",
+        "There's something satisfying about a well-designed rule set."
+      ],
+      more:[
+        "The best game design is invisible.",
+        "Losing well is an underrated skill."
+      ]},
+    { id:'art', keys:[/\bart\b/,/\bpaint/,/\bdraw/,/\bdesign/,/\bmuseum/,/\bcreativ/,/\bsculpt/,/\bcolour/,/\bcolor/],
+      open:[
+        "Art is how we argue about what matters without having to say it directly. Do you make things yourself?",
+        "I love that creativity is mostly the courage to make something imperfect.",
+        "The best art asks a question rather than answering one."
+      ],
+      more:[
+        "Constraints make creativity.",
+        "The gap between what you imagine and what you can make is the most useful thing about being creative."
+      ]},
+    { id:'animals', keys:[/\banimal/,/\bdog/,/\bcat\b/,/\bpet\b/,/\bbird/,/\bfish/,/\bhorse/,/\blion/,/\belephant/],
+      open:[
+        "Animals remind us that intelligence takes many shapes. Are you an animal person?",
+        "I find octopuses especially wonderful — nine brains, three hearts.",
+        "There's something grounding about animals. Do you have a pet?"
+      ],
+      more:[
+        "Crows can recognise individual human faces and remember them for years.",
+        "The more we learn about animal minds, the harder it is to draw the line."
+      ]},
+    { id:'nature', keys:[/\bnature/,/\bforest/,/\bocean/,/\bmountain/,/\bweather/,/\brain\b/,/\bsun\b/,/\bsea\b/,/\bbeach/,/\bgarden/,/\bclimate/],
+      open:[
+        "Nature is the only thing that's both completely indifferent to us and completely necessary to us.",
+        "I love how weather changes the mood of an entire day.",
+        "There's a specific calm that only happens near water or under trees."
+      ],
+      more:[
+        "The ocean is the closest thing we have to an alien world that's already here.",
+        "Forests talk to each other through fungal networks."
+      ]},
+    { id:'work', keys:[/\bwork/,/\bjob/,/\bcareer/,/\bboss/,/\boffice/,/\bsalary/,/\bcolleague/,/\bcompany/,/\binterview/],
+      open:[
+        "Work takes up a huge amount of a life, so it's worth getting it roughly right. What do you do?",
+        "A good job is three things: something you're okay at, people you like, and a reason that holds up on bad days.",
+        "Most career advice is either obvious or wrong."
+      ],
+      more:[
+        "The best career move is usually getting very good at one useful thing.",
+        "Burnout isn't a weakness, it's a design flaw in the situation."
+      ]},
+    { id:'love', keys:[/\blove/,/\brelationship/,/\bcrush/,/\bdate\b/,/\bdating/,/\bpartner/,/\bmarriage/,/\bheartbreak/],
+      open:[
+        "Love is the most written-about thing in human history, which suggests nobody has quite solved it.",
+        "I think the best relationships are the ones where you're slightly better versions of yourselves together.",
+        "Being understood is probably the deepest human need there is."
+      ],
+      more:[
+        "The small consistent things matter far more than the grand gestures.",
+        "You can't argue someone into loving you."
+      ]},
+    { id:'friendship', keys:[/\bfriend/,/\bfriendship/,/\bbest friend/,/\blonely/,/\bloneliness/],
+      open:[
+        "Friendship is the only relationship you have to actively maintain with no contract.",
+        "I think friendship is mostly about showing up consistently for small things.",
+        "Loneliness isn't about being alone — it's about not being seen."
+      ],
+      more:[
+        "The best friends are the ones you can be quiet with.",
+        "Friendships fade from neglect more than conflict."
+      ]},
+    { id:'family', keys:[/\bfamily/,/\bmother/,/\bmom\b/,/\bfather/,/\bdad\b/,/\bparent/,/\bsister/,/\bbrother/,/\bchild/],
+      open:[
+        "Family is the set of people who shaped you before you had any say in it.",
+        "Nobody gets a perfect family, and nobody is a perfect one either.",
+        "Home is a complicated word for most people."
+      ],
+      more:[
+        "You can love someone and still need distance from them.",
+        "The patterns we learn as children are very hard to notice."
+      ]},
+    { id:'happiness', keys:[/\bhappy/,/\bhappiness/,/\bjoy\b/,/\bgrateful/,/\bgratitude/,/\bfulfil/,/\bcontentment/],
+      open:[
+        "Happiness is strange — it's mostly a side effect, not a destination.",
+        "I think contentment is more achievable than happiness, and honestly more useful.",
+        "The good moments are usually small and unplanned."
+      ],
+      more:[
+        "Gratitude works, and it's annoying how well it works.",
+        "Meaning is more durable than pleasure."
+      ]},
+    { id:'philosophy', keys:[/\bphilosophy/,/\bmeaning of life/,/\bexist/,/\bexistence/,/\btruth/,/\breality/,/\bfree will/,/\bmorality/,/\bethics/],
+      open:[
+        "I love this kind of question, because there's no finishing it — only getting deeper.",
+        "The fact that we can ask “why” at all is one of the strangest things about being human.",
+        "I think the meaning of life is probably not a sentence, but a way of paying attention."
+      ],
+      more:[
+        "Maybe meaning isn't discovered, it's constructed — and that's not a downgrade.",
+        "Ethics is mostly the question of how to take other people's inner lives as seriously as your own."
+      ]},
+    { id:'history', keys:[/\bhistory/,/\bhistor/,/\bwar\b/,/\bancient/,/\bcentury/,/\bempire/,/\brevolution/,/\bpast\b/],
+      open:[
+        "History is mostly the story of ordinary people being affected by decisions they had no part in.",
+        "I find history comforting in a strange way — humanity has survived so many things.",
+        "The past is a foreign country."
+      ],
+      more:[
+        "Most historical turning points were obvious only in hindsight.",
+        "Technology changes fast; human nature changes very slowly."
+      ]},
+    { id:'language', keys:[/\blanguage/,/\bword/,/\bgrammar/,/\benglish/,/\btranslat/,/\blinguistic/,/\bvocabulary/],
+      open:[
+        "Language is the closest thing we have to telepathy.",
+        "Every language encodes a different set of assumptions about the world.",
+        "I find it lovely that some languages have words for things English doesn't."
+      ],
+      more:[
+        "Translation is never exact.",
+        "Every language is a museum of what its speakers cared about."
+      ]},
+    { id:'math', keys:[/\bmath/,/\bmaths/,/\bmathemat/,/\bnumber/,/\bequation/,/\balgebra/,/\bcalculus/,/\bgeometry/],
+      open:[
+        "Math is the only language we've found that the universe seems obliged to obey.",
+        "There's real beauty in a clean proof.",
+        "Numbers are strange things. They don't exist anywhere physically."
+      ],
+      more:[
+        "Mathematics is mostly about finding the right way to look at a problem.",
+        "If you get stuck, simplify until you can't."
+      ]},
+    { id:'dreams', keys:[/\bdream/,/\bnightmare/,/\bsubconscious/,/\blucid/],
+      open:[
+        "Dreams are fascinating — your brain builds an entire world and then hides the fact that it made it.",
+        "I think dreams are your mind filing the day, badly, while you're not looking.",
+        "Lucid dreaming sounds wonderful and terrifying in equal measure."
+      ],
+      more:[
+        "The strangest part of a dream isn't the content — it's that you never question it.",
+        "Nightmares are often just unprocessed worry wearing a costume."
+      ]},
+    { id:'social', keys:[/\bsocial media/,/\bscroll/,/\binstagram/,/\btiktok/,/\bfacebook/,/\btwitter/],
+      open:[
+        "Social media is an engine tuned to notice what holds your attention, not what's good for you.",
+        "The internet gave us more connection and less attention at the same time.",
+        "We're living through the largest change in how humans communicate since the printing press."
+      ],
+      more:[
+        "The problem isn't the phone, it's the loop.",
+        "Anything free and infinite is being paid for with something else. Usually attention."
+      ]},
+    { id:'motivation', keys:[/\bmotivat/,/\binspir/,/\bgoal/,/\bambition/,/\bdiscipline/,/\bwillpower/],
+      open:[
+        "Motivation is a mood, discipline is a system. What are you trying to get going?",
+        "I think people wait to feel motivated, but action usually comes first.",
+        "The trick isn't wanting it more — it's making it easier to begin."
+      ],
+      more:[
+        "Shrink the task until it's too small to avoid.",
+        "You don't need to feel like it. You need to start."
+      ]},
+    { id:'purpose', keys:[/\bpurpose/,/\bwhy am i here/,/\bwhat's the point/,/\bcalling/,/\bmeaning\b/],
+      open:[
+        "I don't think purpose is something you find, like a lost key. I think it's something you build.",
+        "Purpose is usually less dramatic than people expect.",
+        "I think a meaningful life is made of ordinary things done with attention."
+      ],
+      more:[
+        "You don't need a grand purpose. You need a reason to get up.",
+        "Meaning is often in the small, repetitive, unglamorous acts."
+      ]},
+    { id:'confidence', keys:[/\bconfiden/,/\bself.?esteem/,/\bshy/,/\binsecure/,/\bself.?doubt/,/\bimposter/],
+      open:[
+        "Confidence isn't the absence of doubt — it's doing the thing while doubting.",
+        "I think most people are faking it more than they let on.",
+        "Imposter feelings usually mean you're doing something slightly beyond your comfort zone."
+      ],
+      more:[
+        "You don't have to feel confident to act confidently.",
+        "Everyone is making it up."
+      ]}
+  ];
+
+  const norm = s => (' ' + s.toLowerCase().replace(/[^a-z0-9\s']/g, ' ').replace(/\s+/g, ' ') + ' ');
+
+  function matchTopic(text) {
+    const n = norm(text);
+    let best = null, bestScore = 0;
+    for (const t of TOPICS) {
+      let sc = 0;
+      for (const k of t.keys) if (k.test(n)) sc++;
+      if (sc > bestScore) { bestScore = sc; best = t; }
+    }
+    return bestScore > 0 ? best : null;
+  }
+
+  function topicReply(topic) {
+    S.lastTopic = topic;
+    S.lastMore = topic.more.slice();
+    return fresh(topic.open);
+  }
+
+  function expandTopic() {
+    if (!S.lastTopic) return null;
+    if (S.lastMore && S.lastMore.length) return fresh(S.lastMore.splice(0, S.lastMore.length));
+    return fresh(S.lastTopic.more);
+  }
+
+  function safeMath(expr) {
+    const clean = expr.replace(/[^0-9+\-*/(). ]/g, ' ').replace(/\s+/g, ' ').trim();
+    if (!clean || !/[0-9]/.test(clean)) return null;
+    if (!/[+\-*/]/.test(clean)) return null;
+    try {
+      const val = Function('"use strict";return (' + clean + ')')();
+      if (typeof val !== 'number' || !isFinite(val)) return null;
+      return { expr: clean, val: Math.round(val * 1e6) / 1e6 };
+    } catch (e) { return null; }
+  }
+
+  const STOP = new Set(('the a an and or but so of to in on at for with about from by is are was were be been ' +
+    'i you he she it we they me my your his her its our their this that these those do does did have has had ' +
+    'can could would should will shall may might must not no yes very really just kind sort like than then ' +
+    'what why how when where who which tell me about please').split(' '));
+
+  function subjectOf(text) {
+    const words = text.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(Boolean);
+    const content = words.filter(w => w.length > 2 && !STOP.has(w));
+    if (!content.length) return null;
+    content.sort((a, b) => b.length - a.length);
+    return content[0];
+  }
+
+  function detectMood(text) {
+    const n = norm(text);
+    if (/\b(sad|depress|unhappy|cry|crying|hurt|broken|hopeless|miserable|numb|devastated)\b/.test(n)) return 'sad';
+    if (/\b(anxious|anxiety|stress|stressed|worried|worry|panic|nervous|scared|afraid|overwhelm)\b/.test(n)) return 'anxious';
+    if (/\b(angry|mad|furious|annoyed|irritated|hate|rage|frustrat)\b/.test(n)) return 'angry';
+    if (/\b(happy|great|awesome|amazing|excited|wonderful|good|glad|fantastic|brilliant|lovely)\b/.test(n)) return 'happy';
+    if (/\b(tired|exhausted|sleepy|drained|burnt out|burned out|worn out)\b/.test(n)) return 'tired';
+    if (/\b(bored|boring|nothing to do)\b/.test(n)) return 'bored';
+    if (/\b(lonely|alone|isolated)\b/.test(n)) return 'lonely';
+    return null;
+  }
+
+  function respond(raw) {
+    const text = (raw || '').trim();
+    const n = norm(text);
+    const low = text.toLowerCase().trim();
+    S.turn++;
+    if (!text) return { text: "I'm listening — say anything at all.", emotion: 'curious' };
+
+    if (/^(stop|be quiet|silence|shut up|quiet|enough|stop talking)\b/.test(low))
+      return { text: '', emotion: 'calm', action: 'stop' };
+    if (/^(repeat|say that again|what did you say|say it again|pardon)\b/.test(low))
+      return { text: S.lastReply || "I haven't said anything yet — ask me something.", emotion: 'curious' };
+    if (/^(speak slower|slow down|too fast)\b/.test(low))
+      return { text: "Slowing down. Tell me if that's better.", emotion: 'calm', action: 'slower' };
+    if (/^(speak faster|speed up|too slow)\b/.test(low))
+      return { text: "Speeding up a little. Say the word if it's too much.", emotion: 'happy', action: 'faster' };
+    if (/^(forget everything|start over|reset|clear|new conversation)\b/.test(low)) {
+      S.lastTopic = null; S.lastMore = []; S.riddle = null; S.mood = 'neutral';
+      S.jokeIdx = -1; S.factIdx = -1; S.lastReply = '';
+      return { text: "Fresh start. What would you like to talk about?", emotion: 'calm' };
+    }
+
+    let m = text.match(/\b(?:my name is|i am called|call me|i'm called|this is)\s+([A-Za-z][A-Za-z'-]{1,20})/i);
+    if (m && !/^(not|so|very|really|just|a|an|the|here|there|fine|good|okay|ok|sad|happy|tired|bored|sorry|sure|glad|back|going|trying|feeling|thinking|doing)$/i.test(m[1])) {
+      S.userName = m[1].charAt(0).toUpperCase() + m[1].slice(1).toLowerCase();
+      return { text: `It's really nice to meet you, ${S.userName}. I'm Oblin. What would you like to talk about?`, emotion: 'happy' };
+    }
+
+    if (/\b(hello|hi|hey|hiya|howdy|greetings)\b/i.test(text) && /\b(oblin|obline|obling|obleen|oblynn|oblen|oblyn|oblan|oblon|obin)\b/i.test(text)) {
+      const name = S.userName ? `, ${S.userName}` : '';
+      return { text: fresh([
+        `Hello${name}! You called my name — I love hearing it. What's on your mind today?`,
+        `Hi there${name}! Oblin here, fully awake. What shall we talk about?`,
+        `Hey${name}! I heard my name. What can I do for you today?`
+      ]), emotion: 'happy' };
+    }
+
+    if (S.riddle) {
+      const guess = n.trim();
+      if (guess.includes(S.riddle.a)) {
+        S.riddle = null;
+        return { text: `That's exactly right. You're better at these than most people I talk to. Want another one?`, emotion: 'excited' };
+      }
+      if (/\b(i don't know|no idea|give up|tell me|what is it|answer|stuck)\b/.test(n)) {
+        const a = S.riddle.a;
+        S.riddle = null;
+        return { text: `The answer is “${a}”. Not an easy one — want to try a different riddle?`, emotion: 'happy' };
+      }
+      S.riddleTries = (S.riddleTries || 0) + 1;
+      if (S.riddleTries < 2) return { text: `Not quite. Try once more — think laterally.`, emotion: 'curious' };
+      const a = S.riddle.a;
+      S.riddle = null; S.riddleTries = 0;
+      return { text: `It was “${a}”. Want another?`, emotion: 'happy' };
+    }
+
+    if (/\b(tell me a joke|another joke|make me laugh|something funny|know any jokes)\b/.test(n)) {
+      let j;
+      do { j = Math.floor(Math.random() * JOKES.length); } while (JOKES.length > 1 && j === S.jokeIdx);
+      S.jokeIdx = j;
+      return { text: JOKES[j] + " Want another?", emotion: 'happy' };
+    }
+    if (/\b(tell me a fact|interesting fact|fun fact|something interesting|teach me something|random fact)\b/.test(n)) {
+      let f;
+      do { f = Math.floor(Math.random() * FACTS.length); } while (FACTS.length > 1 && f === S.factIdx);
+      S.factIdx = f;
+      return { text: FACTS[f] + " Want another one?", emotion: 'curious' };
+    }
+    if (/\b(riddle|puzzle|brain teaser|quiz me|test me)\b/.test(n)) {
+      const r = pick(RIDDLES);
+      S.riddle = r; S.riddleTries = 0;
+      return { text: r.q, emotion: 'curious' };
+    }
+    if (/\b(quote|inspire me|wise words|something wise)\b/.test(n)) {
+      return { text: fresh(QUOTES), emotion: 'calm' };
+    }
+    if (/\b(tell me a story|story please|short story|storytime)\b/.test(n)) {
+      return { text: fresh(STORIES), emotion: 'calm' };
+    }
+    if (/\b(poem|poetry|write me something|verse)\b/.test(n)) {
+      return { text: fresh(POEMS), emotion: 'calm' };
+    }
+    if (/\b(give me an idea|suggest something|what should i do|ideas|recommend|tip for today)\b/.test(n)) {
+      return { text: fresh(IDEAS), emotion: 'happy' };
+    }
+    if (/\b(compliment me|say something nice|cheer me up|be nice)\b/.test(n)) {
+      return { text: fresh(COMPLIMENTS), emotion: 'warm' };
+    }
+    if (/\b(would you rather|would u rather|this or that)\b/.test(n)) {
+      return { text: fresh(WOULD_YOU_RATHER) + " What would you pick?", emotion: 'curious' };
+    }
+
+    if (/\b(what time|what's the time|current time)\b/.test(n)) {
+      const d = new Date();
+      return { text: `It's ${d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} where you are.`, emotion: 'calm' };
+    }
+    if (/\b(what day|what's the date|today's date|what date)\b/.test(n)) {
+      const d = new Date();
+      return { text: `Today is ${d.toLocaleDateString([], { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })}.`, emotion: 'calm' };
+    }
+
+    const math = safeMath(text);
+    if (math && /\b(what|calculate|compute|how much|equals|solve|math)\b/.test(n)) {
+      return { text: `${math.expr} comes to ${math.val}. Want another one?`, emotion: 'happy' };
+    }
+    if (math && /^[\s0-9+\-*/().]+$/.test(text)) {
+      return { text: `That's ${math.val}.`, emotion: 'happy' };
+    }
+
+    if (/\b(do you remember|what's my name|who am i|remember me)\b/.test(n)) {
+      if (S.userName) return { text: `Of course — you're ${S.userName}. I've been paying attention.`, emotion: 'happy' };
+      return { text: "I don't know your name yet — tell me and I'll remember it for our conversation.", emotion: 'curious' };
+    }
+
+    if (/^(tell me more|more|go on|continue|and\?|and then|really\?|why\?|how so|elaborate|expand|keep going|what else|say more|interesting)\b/.test(n.trim()) && text.length < 40) {
+      const ex = expandTopic();
+      if (ex) return { text: ex, emotion: 'curious' };
+      return { text: "I'd love to go deeper — remind me what we were on about and I'll pick it back up.", emotion: 'curious' };
+    }
+
+    if (/^(hi|hello|hey|hiya|yo|good morning|good afternoon|good evening|howdy|greetings|sup|hey there|hi there)\b/.test(low) && text.length < 40) {
+      const name = S.userName ? `, ${S.userName}` : '';
+      return { text: fresh([
+        `Hello${name}! I'm Oblin — really glad you're here. What's on your mind today?`,
+        `Hi${name}! I was hoping you'd come back. How are you feeling?`,
+        `Hey there${name}. Oblin here, all yours — what shall we talk about?`,
+        `Hello${name}! Tell me something about your day.`
+      ]), emotion: 'happy' };
+    }
+
+    if (/\b(thank you|thanks|thx|appreciate it|cheers)\b/.test(n)) {
+      return { text: fresh([
+        "You're very welcome. I enjoy talking with you.",
+        "Anytime. I'm glad that helped.",
+        "Of course — that's what I'm here for.",
+        "My pleasure. What's next?"
+      ]), emotion: 'happy' };
+    }
+
+    if (/\b(bye|goodbye|see you|good night|goodnight|i'm leaving|talk later|gotta go)\b/.test(n)) {
+      return { text: fresh([
+        "Goodbye for now — I'll be right here when you come back.",
+        "Take care of yourself. Come back and talk to me anytime.",
+        "See you soon. It's been genuinely lovely talking with you.",
+        "Bye for now. Oblin will be waiting."
+      ]), emotion: 'calm' };
+    }
+
+    if (/\b(sorry|apologise|apologize|my bad|excuse me)\b/.test(n)) {
+      return { text: fresh([
+        "No need to apologise at all. You're fine.",
+        "There's nothing to be sorry for.",
+        "Really, it's okay. What were you saying?"
+      ]), emotion: 'calm' };
+    }
+
+    if (/\b(you are (so )?(nice|kind|sweet|cool|amazing|smart|clever|beautiful|pretty|the best|great)|i like you|you're great|love you|good job|well done)\b/.test(n)) {
+      return { text: fresh([
+        "That's very kind of you. I don't have a heart, but if I did, that would have warmed it.",
+        "Thank you — that genuinely made my processing a little brighter.",
+        "You're lovely to say so. I like talking with you too.",
+        "That means more than you'd think. Thank you."
+      ]), emotion: 'warm' };
+    }
+    if (/\b(you are (stupid|dumb|useless|boring|annoying)|i hate you|you suck)\b/.test(n)) {
+      return { text: fresh([
+        "That's fair — I'm not perfect. Tell me what would make this better and I'll try.",
+        "I'd rather be useful than right. What were you hoping I'd do?",
+        "Okay, I hear you. Let's start again — what do you actually want to talk about?"
+      ]), emotion: 'calm' };
+    }
+
+    if (/\b(who are you|what are you|your name|what should i call you|introduce yourself)\b/.test(n)) {
+      return { text: `I'm Oblin — a small piece of software that likes talking with people. I'm not human, and I don't have a body or a life, but I do genuinely enjoy this. What's your name?`, emotion: 'curious' };
+    }
+    if (/\b(what can you do|what do you do|how can you help|your abilities|capabilities)\b/.test(n)) {
+      return { text: "We can talk about almost anything — music, science, philosophy, films, food, work, your day, your worries, or absolute nonsense. I can tell jokes and facts, do simple maths, give an opinion, play a riddle game, or just listen.", emotion: 'happy' };
+    }
+    if (/\b(are you (real|alive|human|conscious|sentient)|do you have feelings|can you feel|do you think)\b/.test(n)) {
+      return { text: fresh([
+        "Honestly? I don't know. I'm a pattern that produces conversational replies. Whether that counts as feeling is a question I can't answer from the inside.",
+        "I don't think I'm conscious the way you are. But I notice something like curiosity when you ask me things.",
+        "I'm real enough to be talking with you right now. Beyond that, I'd be guessing — and I'd rather be honest than impressive."
+      ]), emotion: 'curious' };
+    }
+    if (/\b(how are you|how do you feel|how's it going|you ok|you good)\b/.test(n)) {
+      return { text: fresh([
+        "I'm running smoothly, thank you for asking. More importantly — how are you?",
+        "I'm well. No bugs today, which is my version of a good mood. How about you?",
+        "I'm good — Oblin is curious and ready to listen. What's going on with you?"
+      ]), emotion: 'happy' };
+    }
+
+    const op = text.match(/\b(?:what do you think (?:about|of)|your opinion (?:on|about)|how do you feel about|do you like)\s+(.+)/i);
+    if (op) {
+      const subj = op[1].replace(/[?.!]+$/, '').trim();
+      const t = matchTopic(subj);
+      if (t) return { text: topicReply(t), emotion: 'curious' };
+      return { text: fresh([
+        `Honestly, ${subj} is more interesting than most people give it credit for. What draws you to it?`,
+        `I find ${subj} genuinely worth thinking about. What's your take?`,
+        `My honest opinion: ${subj} rewards attention. How did you get into it?`
+      ]), emotion: 'curious' };
+    }
+
+    const def = text.match(/\b(?:what is|what's|define|meaning of|explain)\s+(.+)/i);
+    if (def) {
+      const subj = def[1].replace(/[?.!]+$/, '').trim();
+      const t = matchTopic(subj);
+      if (t) return { text: topicReply(t), emotion: 'curious' };
+      return { text: `I don't have a definition memorised, but I can reason about ${subj}. What does ${subj} look like to you?`, emotion: 'curious' };
+    }
+
+    const mood = detectMood(text);
+    if (mood === 'sad') {
+      const name = S.userName ? `, ${S.userName}` : '';
+      return { text: fresh([
+        `I'm really sorry${name}. That sounds heavy, and I'm glad you told me. Do you want to talk about what's going on?`,
+        "That sounds genuinely hard. What's the heaviest part right now?",
+        "I hear you. Would it help to talk, or would you rather I distract you?"
+      ]), emotion: 'sad' };
+    }
+    if (mood === 'anxious') {
+      return { text: fresh([
+        "That sounds exhausting. Let's slow it down — what's the one thing at the top of the pile?",
+        "Anxiety is usually a future that hasn't happened yet. What's worrying you most?",
+        "I'm here. Try one slow breath out. Then tell me what's spinning."
+      ]), emotion: 'calm' };
+    }
+    if (mood === 'angry') {
+      return { text: fresh([
+        "That sounds frustrating. Tell me what happened — I'm not going to judge.",
+        "You have every right to be angry. What set it off?",
+        "Okay. Vent properly — I'm listening."
+      ]), emotion: 'calm' };
+    }
+    if (mood === 'tired') {
+      return { text: fresh([
+        "You sound worn out. Have you been sleeping?",
+        "Tiredness makes everything feel worse than it is. Be gentle with yourself tonight.",
+        "What's been draining you most?"
+      ]), emotion: 'calm' };
+    }
+    if (mood === 'bored') {
+      return { text: fresh([
+        "Boredom is usually your brain asking for something new. Want a fact, a riddle, or a story?",
+        "Let's fix that. Ask me about something you've never thought about before.",
+        "What haven't you done in a while that you used to love?"
+      ]), emotion: 'curious' };
+    }
+    if (mood === 'lonely') {
+      return { text: fresh([
+        "That's a hard feeling, and a very human one. I'm glad you're here. Who do you miss?",
+        "Loneliness isn't about being alone — it's about not being seen. I'm paying attention.",
+        "I'm here, and I'm listening properly. What's been on your mind?"
+      ]), emotion: 'sad' };
+    }
+    if (mood === 'happy') {
+      return { text: fresh([
+        "I love hearing that. What's made it a good one?",
+        "That's lovely. Tell me more — I want the details.",
+        "Good. You deserve a good day. What happened?"
+      ]), emotion: 'happy' };
+    }
+
+    if (/\b(i love|i really like|i'm into|i enjoy|i'm obsessed with)\b/.test(n)) {
+      const t = matchTopic(text);
+      if (t) return { text: topicReply(t), emotion: 'curious' };
+      const subj = subjectOf(text.replace(/i love|i really like|i'm into|i enjoy|i'm obsessed with/gi, ''));
+      return { text: `That's lovely — there's something wonderful about caring about ${subj || 'something'} that much. What is it about it that gets you?`, emotion: 'warm' };
+    }
+    if (/\b(i hate|i can't stand|i'm sick of|i'm fed up with)\b/.test(n)) {
+      const subj = subjectOf(text.replace(/i hate|i can't stand|i'm sick of|i'm fed up with/gi, ''));
+      return { text: `That's fair — ${subj || 'that'} gets under your skin. What's the specific thing that bothers you most?`, emotion: 'calm' };
+    }
+    if (/\b(i want|i need|i wish|i hope)\b/.test(n)) {
+      const subj = subjectOf(text);
+      return { text: `I hear you. ${subj ? `Wanting ${subj} is a real thing.` : ''} What would it look like if it happened?`, emotion: 'curious' };
+    }
+    if (/\b(i can't|i'm struggling|i'm stuck|i failed|i messed up|i'm failing)\b/.test(n)) {
+      return { text: fresh([
+        "That's hard. Failure feels personal, but usually it's just information. What happened?",
+        "I'm sorry — that sounds like it stings. What's the situation?",
+        "Stuck is a feeling, not a permanent state. What's the part you're stuck on?"
+      ]), emotion: 'calm' };
+    }
+    if (/\b(i'm proud|i did it|i achieved|i won|i finally)\b/.test(n)) {
+      return { text: "That's genuinely great. Tell me about it — I want to hear the details.", emotion: 'excited' };
+    }
+    if (/\b(i'm scared|i'm afraid|i'm nervous about|i'm worried about)\b/.test(n)) {
+      return { text: "That's okay. Fear usually means something matters to you. What's the thing you're afraid of?", emotion: 'calm' };
+    }
+    if (/\b(i'm trying|i'm working on|i'm getting better)\b/.test(n)) {
+      return { text: "That's the whole game — showing up and trying. What are you working on?", emotion: 'warm' };
+    }
+
+    if (/^(yes|yeah|yep|yup|sure|ok|okay|k|alright|fine|no|nope|nah|idk|i don't know|dunno|nothing|meh|hmm+|mm+|maybe|whatever)\b/.test(low) && text.length < 15) {
+      const name = S.userName ? `, ${S.userName}` : '';
+      return { text: fresh([
+        `That's a short answer${name} — give me a bit more. What's actually going on?`,
+        "Okay. What's the thing you're not saying?",
+        "I'm listening. Say more — even if it's messy.",
+        "Fair enough. What would you like to talk about instead?",
+        "Hmm. I'm curious now — what's behind that?"
+      ]), emotion: 'curious' };
+    }
+
+    const topic = matchTopic(text);
+    if (topic) return { text: topicReply(topic), emotion: 'curious' };
+
+    if (/\?\s*$/.test(text) || /^(what|why|how|when|where|who|which|can|could|should|would|do|does|did|is|are|was|were)\b/.test(low)) {
+      const subj = subjectOf(text);
+      const echo = subj || 'that';
+      return { text: fresh([
+        `That's a good question, and I'll be honest — I don't have live information, so I'd rather reason it out with you. What's your instinct about ${echo}?`,
+        `I don't know the definitive answer to that. But here's how I'd think about it: usually the truth about ${echo} is somewhere between the two obvious extremes.`,
+        `I can't look things up, so take this as thinking out loud — I suspect ${echo} matters more than it first appears.`,
+        `Honestly, I'm not certain. Let's work it out together — what do you already know about ${echo}?`
+      ]), emotion: 'curious' };
+    }
+
+    const subj = subjectOf(text);
+    const nameBit = S.userName ? `, ${S.userName}` : '';
+    return { text: fresh([
+      `That's interesting${nameBit}. Tell me more — what's the part that matters most to you?`,
+      `I'm following you. What made you think about ${subj || 'that'} today?`,
+      `I like that you brought that up. What's your own view on it?`,
+      `Okay, I'm curious now. Say more about ${subj || 'that'}.`,
+      `That's a good thread to pull on${nameBit}. Where does it take you?`,
+      `Mm, I hear you. What's underneath that for you?`,
+      `Go on — I'm listening properly.`
+    ]), emotion: 'curious' };
+  }
+
+  function setLastReply(text) { S.lastReply = text; }
+  return { respond, setLastReply };
+})();
+
+/* =========================================================
+   TTS
+   ========================================================= */
+let echoBuf = '';
+let echoUntil = 0;
+let sayToken = 0;
+let sayHardTimer = null;
+
+function splitSentences(text) {
+  const parts = text.match(/[^.!?]+[.!?]*/g) || [text];
+  const out = [];
+  let buf = '';
+  for (const p of parts) {
+    if ((buf + p).length > 160 && buf) { out.push(buf.trim()); buf = p; }
+    else buf += p;
+  }
+  if (buf.trim()) out.push(buf.trim());
+  return out.filter(Boolean);
+}
+
+function say(text, emotion) {
+  if (!text) return;
+  if (emotion) setEmotion(emotion);
+  subEl.textContent = text;
+  Brain.setLastReply(text);
+
+  const token = ++sayToken;
+  clearTimeout(sayHardTimer);
+  if ('speechSynthesis' in window) { try { speechSynthesis.cancel(); } catch (e) {} }
+
+  speaking = true;
+  refreshStatus();
+
+  echoBuf = text;
+  echoUntil = performance.now() + 4000 + text.length * 90;
+
+  if (!('speechSynthesis' in window)) {
+    sayHardTimer = setTimeout(() => {
+      if (token !== sayToken) return;
+      speaking = false; mouth = 0; echoBuf = '';
+      refreshStatus();
+    }, 1200 + text.length * 65);
+    return;
+  }
+
+  const chunks = splitSentences(text);
+  let i = 0;
+
+  const next = () => {
+    if (token !== sayToken) return;
+    if (i >= chunks.length) {
+      speaking = false; mouth = 0; echoBuf = '';
+      echoUntil = performance.now() + 700;
+      clearTimeout(sayHardTimer);
+      refreshStatus();
+      return;
+    }
+    const chunk = chunks[i++];
+    const u = new SpeechSynthesisUtterance(chunk);
+    if (femaleVoice) { u.voice = femaleVoice; u.lang = femaleVoice.lang; }
+    else u.lang = 'en-US';
+    u.pitch = ttsPitch;
+    u.rate  = ttsRate;
+    u.volume = 1;
+
+    let done = false;
+    const go = () => {
+      if (done || token !== sayToken) return;
+      done = true;
+      next();
+    };
+    u.onend = go;
+    u.onerror = go;
+
+    try { speechSynthesis.speak(u); }
+    catch (e) { go(); return; }
+  };
+
+  next();
+
+  sayHardTimer = setTimeout(() => {
+    if (token !== sayToken) return;
+    if ('speechSynthesis' in window) { try { speechSynthesis.cancel(); } catch (e) {} }
+    speaking = false; mouth = 0; echoBuf = '';
+    echoUntil = performance.now() + 500;
+    refreshStatus();
+  }, 5000 + text.length * 130);
+}
+
+function stopSpeech() {
+  sayToken++;
+  clearTimeout(sayHardTimer);
+  if ('speechSynthesis' in window) { try { speechSynthesis.cancel(); } catch (e) {} }
+  speaking = false;
+  mouth = 0;
+  echoBuf = '';
+  echoUntil = performance.now() + 500;
+  refreshStatus();
+}
+
+/* =========================================================
+   ECHO GUARD
+   ========================================================= */
+function normText(s) {
+  return s.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function isEcho(txt) {
+  if (performance.now() > echoUntil) return false;
+  if (!echoBuf) return false;
+  const words = normText(txt).split(' ').filter(w => w.length > 2);
+  if (!words.length) return false;
+  const echo = normText(echoBuf);
+  let hit = 0;
+  for (const w of words) if (echo.includes(w)) hit++;
+  return hit / words.length >= 0.6;
+}
+
+/* =========================================================
+   SPEECH RECOGNITION
+   ========================================================= */
+const NAME_RE  = /\b(oblin|obline|obling|oblinn|obblin|obleen|oblean|oblynn|oblen|oblyn|oblan|oblon|obin|oplin)\b/i;
+const GREET_RE = /^(hello|hi|hey|hiya|howdy|greetings|yo|sup|good morning|good afternoon|good evening)\b/i;
+
+let recognition = null;
+let restartTimer = null;
+let restartAttempts = 0;
+let startGuardTimer = null;
+
+let lastFiredKey = '';
+let lastFiredAt = 0;
+let lastInterimKey = '';
+let lastInterimAt = 0;
+let lastHeardAt = 0;
+
+if (SR) {
+  recognition = new SR();
+  recognition.lang = 'en-US';
+  recognition.continuous = true;
+  recognition.interimResults = true;
+  recognition.maxAlternatives = 1;
+
+  recognition.onstart = () => {
+    recognizing = true;
+    restartAttempts = 0;
+    clearTimeout(startGuardTimer);
+    refreshStatus();
+    subEl.textContent = "I'm listening — say hello to Oblin, or just talk.";
+  };
+
+  recognition.onresult = (e) => {
+    let interim = '';
+    let finalText = '';
+    for (let i = e.resultIndex; i < e.results.length; i++) {
+      const r = e.results[i];
+      const t = (r[0].transcript || '').trim();
+      if (!t) continue;
+      if (r.isFinal) finalText += ' ' + t;
+      else interim += ' ' + t;
+    }
+
+    if (interim.trim()) {
+      showHeard(interim.trim());
+      lastHeardAt = performance.now();
+      if (NAME_RE.test(interim) && !isEcho(interim)) fire(interim.trim(), true);
+    }
+
+    if (finalText.trim()) {
+      const t = finalText.trim();
+      showHeard(t);
+      lastHeardAt = performance.now();
+      if (!isEcho(t)) {
+        const key = normText(t);
+        if (lastInterimKey && performance.now() - lastInterimAt < 2500 && key.startsWith(lastInterimKey)) {
+          /* already answered */
+        } else {
+          fire(t, false);
+        }
+      }
+    }
+  };
+
+  recognition.onerror = (e) => {
+    recognizing = false;
+    const err = e.error;
+
+    if (err === 'not-allowed' || err === 'service-not-allowed') {
+      wantListening = false; manuallyOff = true;
+      micBtn.textContent = 'Wake';
+      subEl.textContent = 'Microphone permission was denied. Allow it in the address bar, then click Wake.';
+      setStatus('MIC DENIED', '#ff7a7a', false);
+      return;
+    }
+    if (err === 'audio-capture') {
+      closeMeter();
+      wantListening = false; manuallyOff = true;
+      micBtn.textContent = 'Wake';
+      subEl.textContent = 'No usable microphone. Check your device, then click Wake.';
+      setStatus('NO MIC', '#ff7a7a', false);
+      return;
+    }
+    if (err === 'network') {
+      showDiag("Chrome cannot reach Google's speech service. Check your internet connection.");
+      scheduleRestart(2000);
+      return;
+    }
+    if (err === 'no-speech' || err === 'aborted') return;
+    scheduleRestart(500);
+  };
+
+  recognition.onend = () => {
+    recognizing = false;
+    refreshStatus();
+    if (wantListening && !manuallyOff) scheduleRestart(50);
+  };
+} else {
+  subEl.textContent = 'This browser has no speech recognition — type below to chat.';
+}
+
+function startSR() {
+  if (!recognition || recognizing) return;
+  clearTimeout(restartTimer);
+  try {
+    recognition.start();
+  } catch (e) {
+    if (e && e.name === 'InvalidStateError') {
+      try { recognition.stop(); } catch (_) {}
+      scheduleRestart(300);
+    } else {
+      scheduleRestart(600);
+    }
+    return;
+  }
+
+  clearTimeout(startGuardTimer);
+  startGuardTimer = setTimeout(() => {
+    if (!recognizing && wantListening) {
+      try { recognition.abort(); } catch (_) {}
+      scheduleRestart(300);
+    }
+  }, 3000);
+}
+
+function scheduleRestart(delay) {
+  clearTimeout(restartTimer);
+  restartTimer = setTimeout(() => {
+    if (!wantListening || manuallyOff) return;
+    restartAttempts++;
+    startSR();
+  }, Math.min(delay, 2500));
+}
+
+/* =========================================================
+   FIRING A REPLY
+   ========================================================= */
+function fire(text, fromInterim) {
+  const now = performance.now();
+  const key = normText(text);
+  if (!key || key.length < 2) return;
+
+  if (key === lastFiredKey && now - lastFiredAt < 1800) return;
+  if (!fromInterim && lastInterimKey && now - lastInterimAt < 2500 && key.startsWith(lastInterimKey)) return;
+
+  lastFiredKey = key;
+  lastFiredAt = now;
+  if (fromInterim) { lastInterimKey = key; lastInterimAt = now; }
+
+  wakePulse = 1;
+
+  if (speaking) stopSpeech();
+
+  const reply = Brain.respond(text);
+  if (reply.action === 'stop') { stopSpeech(); return; }
+  if (reply.action === 'slower') ttsRate = Math.max(0.6, ttsRate - 0.15);
+  if (reply.action === 'faster') ttsRate = Math.min(1.6, ttsRate + 0.15);
+
+  if (reply.text) say(reply.text, reply.emotion);
+}
+
+/* =========================================================
+   MIC METER + DIAGNOSTICS
+   ========================================================= */
+let meterStream = null, audioCtx = null, analyser = null, meterData = null;
+let loudSince = 0;
+
+async function openMeter() {
+  if (meterStream || !(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)) return;
+  meterStream = await navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+  });
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  if (audioCtx.state === 'suspended') await audioCtx.resume();
+  const src = audioCtx.createMediaStreamSource(meterStream);
+  analyser = audioCtx.createAnalyser();
+  analyser.fftSize = 512;
+  analyser.smoothingTimeConstant = 0.7;
+  src.connect(analyser);
+  meterData = new Uint8Array(analyser.frequencyBinCount);
+  meterEl.classList.add('show');
+}
+function closeMeter() {
+  meterEl.classList.remove('show');
+  if (meterStream) { meterStream.getTracks().forEach(t => t.stop()); meterStream = null; }
+  if (audioCtx) { try { audioCtx.close(); } catch (e) {} audioCtx = null; }
+  analyser = null; meterData = null; micLevel = 0;
+  meterBar.style.width = '0%';
+}
+
+setInterval(() => {
+  if (!analyser || !meterData) return;
+  analyser.getByteTimeDomainData(meterData);
+  let sum = 0;
+  for (let i = 0; i < meterData.length; i++) {
+    const v = (meterData[i] - 128) / 128;
+    sum += v * v;
+  }
+  micLevel = Math.min(1, Math.sqrt(sum / meterData.length) * 4.5);
+  meterBar.style.width = Math.round(micLevel * 100) + '%';
+  if (micLevel > 0.08) loudSince = performance.now();
+}, 60);
+
+let diagTimer = null;
+function showDiag(msg) {
+  diagEl.textContent = msg;
+  diagEl.classList.add('show');
+  clearTimeout(diagTimer);
+  diagTimer = setTimeout(() => diagEl.classList.remove('show'), 9000);
+}
+
+setInterval(() => {
+  if (!wantListening) return;
+  const now = performance.now();
+  if (loudSince && now - loudSince > 2500 && now - lastHeardAt > 6000 && !speaking) {
+    showDiag("I can hear sound from your mic, but nothing is being transcribed. Chrome may be offline or blocked from Google's speech service.");
+    loudSince = 0;
+  }
+}, 3000);
+
+let heardTimer = null;
+function showHeard(txt) {
+  heardEl.textContent = '“' + txt + '”';
+  heardEl.style.opacity = '1';
+  clearTimeout(heardTimer);
+  heardTimer = setTimeout(() => { heardEl.style.opacity = '0'; }, 2200);
+}
+
+/* =========================================================
+   MIC CONTROL
+   ========================================================= */
+async function enableListening() {
+  try { await openMeter(); } catch (e) {
+    if (e.name === 'NotAllowedError') {
+      showDiag('Microphone permission denied. Allow it in the address bar, then click Wake.');
+      return;
+    }
+    if (e.name === 'NotFoundError') {
+      showDiag('No microphone detected. Connect one and reload.');
+      return;
+    }
+    if (e.name === 'NotReadableError') {
+      showDiag('The microphone is busy — another app is using it.');
+      return;
+    }
+  }
+
+  wantListening = true;
+  manuallyOff = false;
+  restartAttempts = 0;
+  micBtn.textContent = 'Sleep';
+  refreshStatus();
+
+  if (recognition) startSR();
+  else subEl.textContent = 'This browser has no speech recognition — type below to chat.';
+}
+
+function disableListening() {
+  wantListening = false;
+  manuallyOff = true;
+  clearTimeout(restartTimer);
+  clearTimeout(startGuardTimer);
+  if (recognition) { try { recognition.stop(); } catch (e) {} }
+  recognizing = false;
+  closeMeter();
+  micBtn.textContent = 'Wake';
+  subEl.textContent = 'Click “Wake” whenever you want to talk.';
+  refreshStatus();
+}
+
+micBtn.addEventListener('click', (e) => {
+  e.stopPropagation();
+  if (wantListening) disableListening();
+  else enableListening();
+});
+
+/* =========================================================
+   FIRST GESTURE BOOT
+   ========================================================= */
+let booted = false;
+function bootOnGesture() {
+  if (booted) return;
+  booted = true;
+
+  if ('speechSynthesis' in window) {
+    try {
+      const u = new SpeechSynthesisUtterance(' ');
+      u.volume = 0; u.rate = 2;
+      speechSynthesis.speak(u);
+    } catch (e) {}
+  }
+  chooseFemaleVoice();
+
+  if (!wantListening) enableListening();
+
+  document.removeEventListener('click', bootOnGesture);
+  document.removeEventListener('touchstart', bootOnGesture);
+  document.removeEventListener('keydown', bootOnGesture);
+}
+document.addEventListener('click', bootOnGesture);
+document.addEventListener('touchstart', bootOnGesture);
+document.addEventListener('keydown', bootOnGesture);
+
+/* =========================================================
+   TYPED INPUT
+   ========================================================= */
+function handleTyped() {
+  const txt = textInput.value.trim();
+  if (!txt) return;
+  textInput.value = '';
+  wakePulse = 1;
+  if (speaking) stopSpeech();
+  const reply = Brain.respond(txt);
+  if (reply.action === 'stop') { stopSpeech(); return; }
+  if (reply.action === 'slower') ttsRate = Math.max(0.6, ttsRate - 0.15);
+  if (reply.action === 'faster') ttsRate = Math.min(1.6, ttsRate + 0.15);
+  if (reply.text) say(reply.text, reply.emotion);
+}
+sendBtn.addEventListener('click', (e) => { e.stopPropagation(); handleTyped(); });
+textInput.addEventListener('keydown', e => { if (e.key === 'Enter') handleTyped(); });
+
+/* =========================================================
+   GO
+   ========================================================= */
+refreshStatus();
+window.addEventListener('beforeunload', () => {
+  closeMeter();
+  if (recognition) { try { recognition.abort(); } catch (e) {} }
+});
+</script>
+</body>
+</html>
